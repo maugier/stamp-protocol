@@ -5,6 +5,7 @@ use {
         fmt,
         io,
         net::{
+            IpAddr,
             Ipv6Addr,
             SocketAddr,
             ToSocketAddrs,
@@ -23,16 +24,27 @@ pub enum PacketError {
     MBZViolation,
 }   
 
-#[derive(Debug)]
-pub struct UnsupportedPacketFormat(SocketAddr);
-
-impl fmt::Display for UnsupportedPacketFormat {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Unsupported packet received from {}", self.0)   
+impl PacketError {
+    fn from_source(self, source: SocketAddr, local: IpAddr) -> RequestError {
+        RequestError { source, local, reason: self }
     }
 }
 
-impl Error for UnsupportedPacketFormat {
+#[derive(Debug)]
+pub struct RequestError {
+    source: SocketAddr,
+    local: IpAddr,
+    reason: PacketError,
+}
+
+impl fmt::Display for RequestError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Unsupported packet received from {} to {} ({:?})",
+            self.source, self.local, self.reason )   
+    }
+}
+
+impl Error for RequestError {
     fn source(&self) -> Option<&(dyn Error + 'static)> { None }   
 }
 
@@ -102,17 +114,22 @@ impl StatelessReflector {
     }
 
     fn reply(&mut self) -> Result<(), Box<dyn Error>> {
-        let mut buf = Vec::with_capacity(112);
+        let mut buf = [1; 112];
 
         let (len, source, local) = self.sock.recv_sas(&mut buf)?;
 
         match len {
             44 => { 
-                let reply = SenderPacket::try_from(buf)?.reflect();
+                let buf = &mut buf[..44];
+                let reply = SenderPacket::try_from(buf)
+                    .map_err(|e| e.from_source(source, local))?
+                    .reflect();
+
                 self.sock.send_sas(&*reply, &source, &local)?;
+                Ok(())
+                    
             },
-            // 112 => todo!(),
-            _  => Err(UnsupportedPacketFormat(source)),
+            _  => Err(Box::new(PacketError::IncorrectLength.from_source(source, local) )),
         }
     }
 }   
