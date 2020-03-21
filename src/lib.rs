@@ -1,9 +1,12 @@
+
+mod ntp;
+
 use {
     std::{
-        convert::TryFrom,
         error::Error,
         fmt,
         io,
+        mem,
         net::{
             IpAddr,
             Ipv6Addr,
@@ -11,12 +14,11 @@ use {
             ToSocketAddrs,
             UdpSocket,
         },
-        ops::Deref,
-        time::SystemTime,
     },
-    byteorder::{ReadBytesExt, WriteBytesExt, BigEndian},
+    ntp::Timestamp,
     udp_sas::UdpSas,
 };
+
 
 #[derive(Debug)]
 pub enum PacketError {
@@ -50,50 +52,41 @@ impl Error for RequestError {
 
 const PORT_NUMBER: u16 = 862;
 
-type Sequence = u32;
-type Timestamp = u64;
+type Sequence = [u8; 4];
 
-pub struct SenderPacket<'a>(&'a mut [u8]);
+#[repr(packed)]
+#[derive(Debug)]
+pub struct UnauthenticatedPacket {
+    sequence: Sequence,
+    timestamp: Timestamp,
+    error: [u8; 2],
+    mbz_0: [u8; 2],
+    receive: Timestamp,
+    sender_sequence: Sequence,
+    sender_timestamp: Timestamp,
+    sender_error: [u8; 2],
+    mbz_1: [u8; 2],
+    ttl: u8,
+    mbz_2: [u8; 3],
+    tail: [u8]
+}
 
-
-impl<'a> TryFrom<&'a mut [u8]> for SenderPacket<'a> {
-    type Error = PacketError;
-
-    fn try_from(packet: &'a mut [u8]) -> Result<Self,PacketError> {
-        if packet.len() != 44 {
-            return Err(PacketError::IncorrectLength)
+impl UnauthenticatedPacket {
+    fn from_buffer(buf: &mut [u8]) -> Result<&mut UnauthenticatedPacket, PacketError> {
+        if buf.len() < 44 {
+            return Err(PacketError::IncorrectLength);
         }
 
-        if &packet[14..44] != &[0; 30] {
-            return Err(PacketError::MBZViolation)
-        }
+        Ok(unsafe { mem::transmute(buf) })
 
-        Ok(Self(packet))
-    }
-
-}
-
-impl<'a> SenderPacket<'a> {
-    fn reflect(self) -> ReflectorPacket<'a> {
-        let packet = self.0;
-
-        ReflectorPacket(packet)
     }
 }
 
-pub struct ReflectorPacket<'a> (&'a mut [u8]);
-
-impl<'a> Deref for ReflectorPacket<'a> {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] { self.0 }
-}
 
 pub struct StatelessReflector {
     sock: UdpSocket
 }
 
-pub struct ErrorMeasure(u16);
-    
 
 
 impl StatelessReflector {
@@ -102,7 +95,9 @@ impl StatelessReflector {
     }
 
     pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<Self, io::Error> {
-        Ok(Self { sock: UdpSocket::bind_sas(addr)? })
+        let sock = UdpSocket::bind_sas(addr)?;
+        sock.set_ttl(255)?;
+        Ok(Self { sock })
     }
 
     pub fn run(mut self) {
@@ -114,23 +109,31 @@ impl StatelessReflector {
     }
 
     fn reply(&mut self) -> Result<(), Box<dyn Error>> {
-        let mut buf = [1; 112];
+        let mut buf = [1; 4096];
 
         let (len, source, local) = self.sock.recv_sas(&mut buf)?;
+        let ts = Timestamp::now()?;
+    
+        let packet = &mut buf[..len];
 
-        match len {
-            44 => { 
-                let buf = &mut buf[..44];
-                let reply = SenderPacket::try_from(buf)
-                    .map_err(|e| e.from_source(source, local))?
-                    .reflect();
+        {
+            let mut packet = UnauthenticatedPacket::from_buffer(packet)
+                .map_err(|e| e.from_source(source, local))?;
 
-                self.sock.send_sas(&*reply, &source, &local)?;
-                Ok(())
-                    
-            },
-            _  => Err(Box::new(PacketError::IncorrectLength.from_source(source, local) )),
+            packet.mbz_0 = [0; 2];
+            packet.mbz_1 = [0; 2];
+            packet.mbz_2 = [0; 3];
+
+            packet.sender_sequence = packet.sequence;
+            packet.sender_timestamp = packet.timestamp;
+            packet.sender_error = packet.error;
+
+            packet.receive = ts;
+            packet.timestamp = Timestamp::now()?;
         }
+
+        self.sock.send_sas(packet, &source, &local)?;
+        Ok(())
     }
 }   
 
